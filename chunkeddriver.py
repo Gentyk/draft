@@ -518,7 +518,8 @@ class ChunkedBackupDriver(driver.BackupDriver):
         data = volume_file.read(read_bytes)
         return data, data_offset
 
-    def create_thread(self, object_id, backup, win32_disk_size, volume_file, sha256_list, container, extra_metadata):
+    def create_thread(self, object_id, backup, win32_disk_size, volume_file, sha256_list, container, extra_metadata,
+                      parent_backup, shaindex, parent_backup_shalist):
         object_name = '%s-%05d' % (self.object_meta['prefix'], object_id)
 
         # First of all, we check the status of this backup. If it
@@ -532,10 +533,42 @@ class ChunkedBackupDriver(driver.BackupDriver):
         shalist = eventlet.tpool.execute(self._calculate_sha, data)
         sha256_list.extend(shalist)
 
-        thread = Thread(target=self.write_backup, args=[data, container, object_name, extra_metadata])
-        obj = self.generate_object_data_for_object_meta(data, data_offset, object_name)
-        thread.start()
-        return thread, obj
+        # If parent_backup is not None, that means an incremental
+        # backup will be performed.
+        if parent_backup:
+            # Find the extent that needs to be backed up.
+            extent_off = -1
+            for idx, sha in enumerate(shalist):
+                if sha != parent_backup_shalist[shaindex]:
+                    if extent_off == -1:
+                        # Start of new extent.
+                        extent_off = idx * self.sha_block_size_bytes
+                else:
+                    if extent_off != -1:
+                        # We've reached the end of extent.
+                        extent_end = idx * self.sha_block_size_bytes
+                        segment = data[extent_off:extent_end]
+                        thread = Thread(target=self.write_backup, args=[segment, container, object_name, extra_metadata])
+                        obj = self.generate_object_data_for_object_meta(segment, data_offset + extent_off, object_name)
+                        thread.start()
+
+                        extent_off = -1
+                shaindex += 1
+
+            # The last extent extends to the end of data buffer.
+            if extent_off != -1:
+                extent_end = len(data)
+                segment = data[extent_off:extent_end]
+
+                thread = Thread(target=self.write_backup, args=[segment, container, object_name, extra_metadata])
+                obj = self.generate_object_data_for_object_meta(segment, data_offset + extent_off, object_name)
+                thread.start()
+                extent_off = -1
+        else:  # Do a full backup.
+            thread = Thread(target=self.write_backup, args=[data, container, object_name, extra_metadata])
+            obj = self.generate_object_data_for_object_meta(data, data_offset, object_name)
+            thread.start()
+            return thread, obj
 
     def backup(self, backup, volume_file, backup_metadata=True):
         """Backup the given volume.
@@ -554,6 +587,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
         # is given.
         parent_backup_shafile = None
         parent_backup = None
+        parent_backup_shalist=None
         if backup.parent_id:
             parent_backup = objects.Backup.get_by_id(self.context,
                                                      backup.parent_id)
@@ -609,13 +643,15 @@ class ChunkedBackupDriver(driver.BackupDriver):
         sha256_list = object_sha256['sha256s']
         shaindex = 0
         is_backup_canceled = False
+
         start_time2 = datetime.now()
         sum_backup_chunk_= 0
         time_volume_file = 0
         threads = []
         object_id = self.object_meta['id']
         for i in range(4):
-            thread, obj = self.create_thread(object_id, backup, win32_disk_size, volume_file, sha256_list, container, extra_metadata)
+            thread, obj = self.create_thread(object_id, backup, win32_disk_size, volume_file, sha256_list, container,
+                                             extra_metadata, parent_backup, shaindex, parent_backup_shalist)
 
             if thread is None and obj is None:
                 break
@@ -645,7 +681,8 @@ class ChunkedBackupDriver(driver.BackupDriver):
 
             del threads[0]
 
-            thread, obj = self.create_thread(object_id, backup, win32_disk_size, volume_file, sha256_list, container, extra_metadata)
+            thread, obj = self.create_thread(object_id, backup, win32_disk_size, volume_file, sha256_list, container,
+                                             extra_metadata, parent_backup, shaindex, parent_backup_shalist)
 
             if thread is None and obj is None:
                 continue
